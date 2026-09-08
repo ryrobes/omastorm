@@ -174,12 +174,20 @@ next volume at its newest chunk, so a poll that arrives after more than the
 Start chunk landed fetches the skipped ones the same way first, and the
 assembler treats any chunk of a new volume as its beginning. Every call sits under a
 30 s timeout (60 s for discovery); a failure reports `offline` and backs off
-5 s, four in a row restart from discovery, and discovery failures back off
-5 s doubling to 60 s. Discovery finding no volume for the station at all is
+5 s, two in a row restart from discovery (a transport error such as
+`IncompleteMessage` on the shared HTTP pool can leave `try_next` waiting
+for a chunk that will never arrive; rediscovery makes a new iterator),
+and discovery failures back off 5 s doubling to 60 s. `try_next` returning
+None for 90 s also rediscovers: higher cuts of the same volume still yield
+Some every few seconds, so a live join is not restarted mid-scan. Discovery
+finding no volume for the station at all is
 the bucket's answer, not a failure: it reports `unavailable` and retries on
-the same back-off. Once a second `main.rs` re-judges a reachable feed from
+the same back-off. If the poller task ends without a site switch, `main.rs`
+respawns it after 5 s so UNAVAILABLE is not a dead end. Once a second
+`main.rs` re-judges a reachable feed from
 the newest radial received: `ok`, `stale` at 10 min, `unavailable` at
-30 min. Each chunk's radials feed an `Assembler` that keeps the
+30 min. Live poller logs flush after each line: stderr is `engine.log`,
+which is fully buffered as a file. Each chunk's radials feed an `Assembler` that keeps the
 radials of elevation number 1 in arrival order; the cut ends when a radial
 says `ElevationEnd` or the next cut's first radial arrives, and a Start chunk
 begins a new volume. Every chunk that grows or ends the cut becomes an event;

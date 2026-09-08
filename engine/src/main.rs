@@ -61,6 +61,11 @@ const QUEUE: usize = 128;
 /// states).
 const STALE_AFTER: Duration = Duration::from_secs(600);
 const UNAVAILABLE_AFTER: Duration = Duration::from_secs(1800);
+/// How soon a live poller that has exited is replaced. Short so a panic
+/// or a closed event channel cannot leave the UI on UNAVAILABLE until the
+/// user changes stations; long enough that a task which exits immediately
+/// is not respawned in a tight loop.
+const POLLER_REVIVE: Duration = Duration::from_secs(5);
 /// Playback advances one frame per tick and loops (DESIGN.md, timeline).
 const PLAY_LOOP: Duration = Duration::from_secs(10);
 const PLAY_STEP_MIN: Duration = Duration::from_millis(250);
@@ -283,6 +288,18 @@ struct Arrival {
     start_ms: i64,
     end_ms: i64,
 }
+/// A selected live station whose poller task is gone, once the cooldown
+/// since it was spawned has passed: respawn it. `running` is false when
+/// there is no handle or the handle has finished.
+fn poller_should_revive(
+    selected: bool,
+    running: bool,
+    since_start: Duration,
+    cooldown: Duration,
+) -> bool {
+    selected && !running && since_start >= cooldown
+}
+
 /// The condition of a reachable feed from the age of the newest radial the
 /// station has published: `Ok`, then `Stale`, then `Unavailable`. `Loading`
 /// and `Offline` are not judged by age: a switch or the poller set them and
@@ -489,8 +506,12 @@ struct Shared {
     dir: PathBuf,
     catalog: Arc<catalog::Catalog>,
     /// The poller for the selected station in live mode (`live.rs`);
-    /// aborted and replaced by a site switch.
+    /// aborted and replaced by a site switch or by `revive_poller` when
+    /// the task has ended without one.
     live: Option<JoinHandle<()>>,
+    /// When the poller was last spawned, so a task that exits immediately
+    /// is not respawned every cleanup tick.
+    poller_started: Instant,
     events: Sender<live::Event>,
     /// `scanTime` of the newest complete frame, milliseconds since the
     /// epoch, for `connection.ageSeconds`; `None` while there is none.
@@ -610,9 +631,6 @@ impl Shared {
                 );
             }
         };
-        if let Some(task) = self.live.take() {
-            task.abort();
-        }
         self.frame_ms = frame_ms;
         let cached: Vec<i64> = listed.iter().map(|e| e.start_ms).collect();
         self.timeline = Timeline::new(listed);
@@ -621,12 +639,36 @@ impl Shared {
         self.state.site.id = station.id.clone();
         self.state.source = Source::Live;
         self.state.connection.status = ConnectionStatus::Loading;
-        self.live = Some(tokio::spawn(live::poll(
-            station.id,
-            self.events.clone(),
-            cached,
-        )));
+        self.spawn_poller(station.id, cached);
         (true, None)
+    }
+    /// Replace the live poller for `site`. Aborts a still-running one.
+    fn spawn_poller(&mut self, site: String, cached: Vec<i64>) {
+        if let Some(task) = self.live.take() {
+            task.abort();
+        }
+        self.live = Some(tokio::spawn(live::poll(site, self.events.clone(), cached)));
+        self.poller_started = Instant::now();
+    }
+    /// The poller task ended without a site switch. Spawn another on the
+    /// same station, keeping the timeline, so UNAVAILABLE is not a dead end.
+    fn revive_poller(&mut self) {
+        let id = self.state.site.id.clone();
+        if id.is_empty() || self.state.source != Source::Live {
+            return;
+        }
+        let cached: Vec<i64> = self.timeline.stored.iter().map(|e| e.start_ms).collect();
+        eprintln!("Live {id}: poller ended; restarting");
+        let _ = io::stderr().flush();
+        self.spawn_poller(id, cached);
+    }
+    fn poller_dead(&self) -> bool {
+        poller_should_revive(
+            !self.state.site.id.is_empty() && self.state.source == Source::Live,
+            self.live.as_ref().is_some_and(|task| !task.is_finished()),
+            self.poller_started.elapsed(),
+            POLLER_REVIVE,
+        )
     }
     /// A pan settled with the map centred at `lat`, `lon`. While following and
     /// not locked, the nearest station takes over when it beats the current
@@ -940,6 +982,7 @@ async fn live_events(shared: Arc<Mutex<Shared>>, mut events: Receiver<live::Even
                         if complete { "complete" } else { "partial" },
                         started.elapsed()
                     );
+                    let _ = io::stderr().flush();
                     Ok(Arrival {
                         frame,
                         texture,
@@ -995,6 +1038,7 @@ async fn live_events(shared: Arc<Mutex<Shared>>, mut events: Receiver<live::Even
                         frame.scan_time,
                         provenance
                     );
+                    let _ = io::stderr().flush();
                     Ok(Entry {
                         id: frame.id,
                         scan_time: frame.scan_time,
@@ -1038,6 +1082,7 @@ fn report(shared: &Mutex<Shared>, site: &str, reason: &str, condition: Connectio
         return;
     }
     eprintln!("Live {site}: {reason}");
+    let _ = io::stderr().flush();
     if set(&mut shared.state.connection.status, condition) {
         shared.broadcast();
     }
@@ -1489,6 +1534,7 @@ fn serve(dir: PathBuf) -> io::Result<()> {
         dir: dir.clone(),
         catalog,
         live: None,
+        poller_started: Instant::now(),
         events,
         frame_ms,
         timeline: Timeline::new(entries),
@@ -1519,6 +1565,9 @@ fn serve(dir: PathBuf) -> io::Result<()> {
             // Once a second while live, `ageSeconds` and `stale` move on a
             // quiet feed; `broadcast` sends nothing when nothing changed.
             let mut shared = cleanup_shared.lock().unwrap();
+            if shared.poller_dead() {
+                shared.revive_poller();
+            }
             if shared.state.source == Source::Live {
                 shared.broadcast();
             }
@@ -1818,6 +1867,34 @@ mod tests {
         assert!(timeline.following());
         assert_eq!(timeline.advance(), Some(0));
         assert!(!timeline.following());
+    }
+
+    #[test]
+    fn a_dead_poller_is_revived_after_the_cooldown() {
+        assert!(!poller_should_revive(
+            true,
+            true,
+            Duration::from_secs(60),
+            POLLER_REVIVE
+        ));
+        assert!(!poller_should_revive(
+            true,
+            false,
+            POLLER_REVIVE - Duration::from_millis(1),
+            POLLER_REVIVE
+        ));
+        assert!(poller_should_revive(
+            true,
+            false,
+            POLLER_REVIVE,
+            POLLER_REVIVE
+        ));
+        assert!(!poller_should_revive(
+            false,
+            false,
+            Duration::from_secs(60),
+            POLLER_REVIVE
+        ));
     }
 
     #[test]
