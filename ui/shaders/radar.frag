@@ -45,6 +45,14 @@ const float R_M = 6371000.0;
 const float EARTH_M = R_M * 4.0 / 3.0;
 const float PI = 3.14159265358979;
 const int density[9] = int[9](0,7,3,6,4,8,2,5,1);
+// Inverse sRGB EOTF: recover the stored byte from a linearized sample.
+float srgbOetf(float lin) {
+    if (lin <= 0.0031308) return 12.92 * lin;
+    return 1.055 * pow(max(lin, 0.0), 1.0 / 2.4) - 0.055;
+}
+int texelByte(float t) {
+    return int(round(clamp(srgbOetf(t), 0.0, 1.0) * 255.0));
+}
 // Hyperbolics spelled with exp so every GLSL target qsb emits has them. For
 // small arguments exp(x) - exp(-x) cancels to a few significant bits, so the
 // small terms below take their series instead; the rendering test replays
@@ -116,15 +124,15 @@ void main() {
     // Azimuth clockwise from north, in tenths of a degree, names the row.
     float entry = clamp(floor(azimuth * 10.0), 0.0, 3599.0);
     vec4 lut = texture(azimuthLut, vec2((entry + .5) / 3600.0, .5));
-    float row = floor(lut.r * 255.0 + .5) + 256.0 * floor(lut.g * 255.0 + .5);
+    float row = float(texelByte(lut.r) + 256 * texelByte(lut.g));
     vec2 uv = vec2((floor(gate + .5) + .5) / float(gates), (row + .5) / float(rays));
     vec4 code = texture(sweep, uv);
     // The raw moment byte in B decides the floor, so a floor can sit inside a
     // palette band; folded and below-threshold codes (0, 1) are never weak.
-    int raw = int(round(code.b * 255.0));
+    int raw = texelByte(code.b);
     if (weakBelow > 0 && raw >= 2 && raw < weakBelow) { fragColor=vec4(0); return; }
-    int value = int(round(code.r * 255.0));
-    int status = int(round(code.g * 255.0));
+    int value = texelByte(code.r);
+    int status = texelByte(code.g);
     vec2 phase = mod(pixel,3.0);
     if (value == 0) {
         // Folded is a two-tone X in every treatment, never an intensity swatch.

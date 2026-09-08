@@ -422,19 +422,39 @@ Item {
     // Upload the immutable sweep and its azimuth lookup once. Pan/zoom updates
     // shader uniforms; the polar-to-screen lookup runs in the shader and no
     // JavaScript visits radar cells.
+    // Data PNGs, not pictures: class (0–12) and moment codes (0–255) live in
+    // the channels. Qt 6 samples 8-bit images as sRGB, so those bytes
+    // linearize toward 0 and round(r*255) draws nothing; radar.frag undoes
+    // the EOTF. The Images must stay in-window (a culled item is not a
+    // texture) at native size (Stretch aliases the LUT). An opaque fill
+    // covers them so they are not shown as polar pictures.
     Image {
-        id: sweepTexture
+        id: sweepImage
+        z: -2
+        colorSpace.namedColorSpace: ColorSpace.SRgbLinear
         source: map.texture
-        visible: false
         smooth: false
         mipmap: false
+        cache: false
+        onStatusChanged: if (status === Image.Error) map.error = "Radar texture failed to load"
     }
     Image {
-        id: azimuthTexture
+        id: azimuthImage
+        z: -2
+        colorSpace.namedColorSpace: ColorSpace.SRgbLinear
         source: map.azimuthLut
-        visible: false
+        y: sweepImage.height
         smooth: false
         mipmap: false
+        cache: false
+        onStatusChanged: if (status === Image.Error) map.error = "Azimuth lookup failed to load"
+    }
+    // Cover the data PNGs. They must stay in-window (not culled) so
+    // ShaderEffect can sample them, but they are not pictures.
+    Rectangle {
+        z: -1
+        anchors.fill: parent
+        color: map.theme ? map.theme.background : "#000000"
     }
     // The frame's palette as a bands x 1 strip; the shader samples
     // texel centers, so radar and legend share the socket palette.
@@ -470,8 +490,11 @@ Item {
         anchors.fill: parent
         onStatusChanged: if (status === ShaderEffect.Error) map.error = "Radar GPU shader failed: " + log
         Component.onCompleted: if (GraphicsInfo.api === GraphicsInfo.Software) map.error = "Radar requires GPU rendering (OpenGL/Vulkan)."
-        property var sweep: sweepTexture
-        property var azimuthLut: azimuthTexture
+        // Sample the Images themselves (they are texture providers). A
+        // ShaderEffectSource FBO of the same PNG still went through sRGB and
+        // rounded every class byte to 0 on Qt 6.11 / NVIDIA.
+        property var sweep: sweepImage
+        property var azimuthLut: azimuthImage
         property var swatches: paletteTexture
         property int bands: map.bands
         // Sweep geometry travels as uniforms; the frame's numbers are the
