@@ -67,6 +67,13 @@ captures cover all three treatments because the archived scan has no folded gate
 Follow-ups: consider rendering legend swatches with the active treatment; consider
 mirroring the monospace font's actual shade-glyph patterns in the glyph masks.
 
+Wayland/OpenGL ES compatibility (2026-09-08): the packaged GLSL ES 100 shader
+must express the density mask as scalar branches. Its constant-array initializer
+was rejected by NVIDIA's ES compiler, hiding radar in every treatment, although
+the desktop OpenGL offscreen checks passed. `densityAt` preserves all nine mask
+values and the existing pixel rule. Reproduced and checked on Wayland with an
+RTX 3090 Ti; data textures retain their original raw-byte sampling.
+
 ### Palette from state (decided 2026-09-06)
 
 `frame.palette` stays in the protocol and is the only source of radar color.
